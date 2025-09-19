@@ -1,92 +1,64 @@
 package sub
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/MHSanaei/3x-ui/database/model"
 	"github.com/MHSanaei/3x-ui/logger"
-	"github.com/MHSanaei/3x-ui/util/json_util"
-	"github.com/MHSanaei/3x-ui/util/random"
 	"github.com/MHSanaei/3x-ui/web/service"
 	"github.com/MHSanaei/3x-ui/xray"
+	"gopkg.in/yaml.v3"
+	"github.com/MHSanaei/3x-ui/util/random"
 )
 
-//go:embed default.json
-var defaultJson string
-
-type SubJsonService struct {
-	configJson       map[string]any
-	defaultOutbounds []json_util.RawMessage
-	fragment         string
-	noises           string
-	mux              string
-
-	inboundService service.InboundService
-	SubService     *SubService
+type SubClashYAMLService struct {
+	fragment      string
+	noises        string
+	SubService    *SubService
+	inboundSvc    service.InboundService
+	defaultGroups []map[string]any
 }
 
-func NewSubJsonService(fragment string, noises string, mux string, rules string, subService *SubService) *SubJsonService {
-	var configJson map[string]any
-	var defaultOutbounds []json_util.RawMessage
-	json.Unmarshal([]byte(defaultJson), &configJson)
-	if outboundSlices, ok := configJson["outbounds"].([]any); ok {
-		for _, defaultOutbound := range outboundSlices {
-			jsonBytes, _ := json.Marshal(defaultOutbound)
-			defaultOutbounds = append(defaultOutbounds, jsonBytes)
-		}
-	}
-
-	if rules != "" {
-		var newRules []any
-		routing, _ := configJson["routing"].(map[string]any)
-		defaultRules, _ := routing["rules"].([]any)
-		json.Unmarshal([]byte(rules), &newRules)
-		defaultRules = append(newRules, defaultRules...)
-		routing["rules"] = defaultRules
-		configJson["routing"] = routing
-	}
-
-	if fragment != "" {
-		defaultOutbounds = append(defaultOutbounds, json_util.RawMessage(fragment))
-	}
-
-	if noises != "" {
-		defaultOutbounds = append(defaultOutbounds, json_util.RawMessage(noises))
-	}
-
-	return &SubJsonService{
-		configJson:       configJson,
-		defaultOutbounds: defaultOutbounds,
-		fragment:         fragment,
-		noises:           noises,
-		mux:              mux,
-		SubService:       subService,
+// 初始化服务
+func NewSubClashYAMLService(fragment, noises string, subService *SubService) *SubClashYAMLService {
+	return &SubClashYAMLService{
+		fragment:   fragment,
+		noises:     noises,
+		SubService: subService,
+		defaultGroups: []map[string]any{
+			{
+				"name":    "auto",
+				"type":    "select",
+				"proxies": []string{},
+			},
+			{
+				"name":    "fallback",
+				"type":    "select",
+				"proxies": []string{},
+			},
+		},
 	}
 }
 
-func (s *SubJsonService) GetJson(subId string, host string) (string, string, error) {
+// 生成 OpenClash YAML 订阅
+func (s *SubClashYAMLService) GetClashYAML(subId string, host string) (string, string, error) {
 	inbounds, err := s.SubService.getInboundsBySubId(subId)
 	if err != nil || len(inbounds) == 0 {
 		return "", "", err
 	}
 
-	var header string
-	var traffic xray.ClientTraffic
 	var clientTraffics []xray.ClientTraffic
-	var configArray []json_util.RawMessage
+	proxies := []map[string]any{}
 
-	// Prepare Inbounds
 	for _, inbound := range inbounds {
-		clients, err := s.inboundService.GetClients(inbound)
-		if err != nil {
-			logger.Error("SubJsonService - GetClients: Unable to get clients from inbound")
-		}
-		if clients == nil {
+		clients, err := s.inboundSvc.GetClients(inbound)
+		if err != nil || clients == nil {
 			continue
 		}
+
+		// Fallback master
 		if len(inbound.Listen) > 0 && inbound.Listen[0] == '@' {
 			listen, port, streamSettings, err := s.SubService.getFallbackMaster(inbound.Listen, inbound.StreamSettings)
 			if err == nil {
@@ -99,277 +71,166 @@ func (s *SubJsonService) GetJson(subId string, host string) (string, string, err
 		for _, client := range clients {
 			if client.Enable && client.SubID == subId {
 				clientTraffics = append(clientTraffics, s.SubService.getClientTraffics(inbound.ClientStats, client.Email))
-				newConfigs := s.getConfig(inbound, client, host)
-				configArray = append(configArray, newConfigs...)
+				proxies = append(proxies, s.genClashProxy(inbound, client, host)...)
 			}
 		}
 	}
 
-	if len(configArray) == 0 {
+	if len(proxies) == 0 {
 		return "", "", nil
 	}
 
-	// Prepare statistics
-	for index, clientTraffic := range clientTraffics {
-		if index == 0 {
-			traffic.Up = clientTraffic.Up
-			traffic.Down = clientTraffic.Down
-			traffic.Total = clientTraffic.Total
-			if clientTraffic.ExpiryTime > 0 {
-				traffic.ExpiryTime = clientTraffic.ExpiryTime
-			}
+	// 累加流量统计
+	var traffic xray.ClientTraffic
+	for i, cTraffic := range clientTraffics {
+		if i == 0 {
+			traffic = cTraffic
 		} else {
-			traffic.Up += clientTraffic.Up
-			traffic.Down += clientTraffic.Down
-			if traffic.Total == 0 || clientTraffic.Total == 0 {
+			traffic.Up += cTraffic.Up
+			traffic.Down += cTraffic.Down
+			if traffic.Total == 0 || cTraffic.Total == 0 {
 				traffic.Total = 0
 			} else {
-				traffic.Total += clientTraffic.Total
+				traffic.Total += cTraffic.Total
 			}
-			if clientTraffic.ExpiryTime != traffic.ExpiryTime {
+			if cTraffic.ExpiryTime != traffic.ExpiryTime {
 				traffic.ExpiryTime = 0
 			}
 		}
 	}
 
-	// Combile outbounds
-	var finalJson []byte
-	if len(configArray) == 1 {
-		finalJson, _ = json.MarshalIndent(configArray[0], "", "  ")
-	} else {
-		finalJson, _ = json.MarshalIndent(configArray, "", "  ")
+	// 填充 proxy-groups 中的 proxies
+	for _, group := range s.defaultGroups {
+		if list, ok := group["proxies"].([]string); ok {
+			for _, p := range proxies {
+				list = append(list, p["name"].(string))
+			}
+			group["proxies"] = list
+		}
 	}
 
-	header = fmt.Sprintf("upload=%d; download=%d; total=%d; expire=%d", traffic.Up, traffic.Down, traffic.Total, traffic.ExpiryTime/1000)
-	return string(finalJson), header, nil
+	// 自动生成常用规则，可根据实际情况扩展
+	rules := []any{
+		"DOMAIN-SUFFIX,google.com,auto",
+		"DOMAIN-SUFFIX,github.com,auto",
+		"DOMAIN-KEYWORD,youtube,auto",
+		"DOMAIN-SUFFIX,twitch.tv,auto",
+		"FINAL,auto",
+	}
+
+	// 生成 YAML
+	yamlMap := map[string]any{
+		"proxies":      proxies,
+		"proxy-groups": s.defaultGroups,
+		"rules":        rules,
+	}
+
+	yamlBytes, err := yaml.Marshal(yamlMap)
+	if err != nil {
+		logger.Error("Failed to marshal YAML: %v", err)
+		return "", "", err
+	}
+
+	header := fmt.Sprintf("upload=%d; download=%d; total=%d; expire=%d",
+		traffic.Up, traffic.Down, traffic.Total, traffic.ExpiryTime/1000)
+
+	return string(yamlBytes), header, nil
 }
 
-func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, host string) []json_util.RawMessage {
-	var newJsonArray []json_util.RawMessage
-	stream := s.streamData(inbound.StreamSettings)
+// 生成 Clash 风格 proxies
+func (s *SubClashYAMLService) genClashProxy(inbound *model.Inbound, client model.Client, host string) []map[string]any {
+	stream := map[string]any{}
+	_ = json.Unmarshal([]byte(inbound.StreamSettings), &stream)
+
+	proxies := []map[string]any{}
 
 	externalProxies, ok := stream["externalProxy"].([]any)
 	if !ok || len(externalProxies) == 0 {
 		externalProxies = []any{
 			map[string]any{
-				"forceTls": "same",
-				"dest":     host,
-				"port":     float64(inbound.Port),
-				"remark":   "",
+				"dest": host,
+				"port": float64(inbound.Port),
 			},
 		}
 	}
 
-	delete(stream, "externalProxy")
-
 	for _, ep := range externalProxies {
-		extPrxy := ep.(map[string]any)
-		inbound.Listen = extPrxy["dest"].(string)
-		inbound.Port = int(extPrxy["port"].(float64))
-		newStream := stream
-		switch extPrxy["forceTls"].(string) {
-		case "tls":
-			if newStream["security"] != "tls" {
-				newStream["security"] = "tls"
-				newStream["tslSettings"] = map[string]any{}
-			}
-		case "none":
-			if newStream["security"] != "none" {
-				newStream["security"] = "none"
-				delete(newStream, "tslSettings")
-			}
+		extPrxy, ok := ep.(map[string]any)
+		if !ok { continue }
+
+		p := map[string]any{
+			"name":   fmt.Sprintf("%s-%s", client.Email, extPrxy["dest"].(string)),
+			"server": extPrxy["dest"].(string),
+			"port":   int(extPrxy["port"].(float64)),
 		}
-		streamSettings, _ := json.MarshalIndent(newStream, "", "  ")
 
-		var newOutbounds []json_util.RawMessage
-
+		// 协议类型
 		switch inbound.Protocol {
-		case "vmess":
-			newOutbounds = append(newOutbounds, s.genVnext(inbound, streamSettings, client, ""))
-		case "vless":
-			var vlessSettings model.VLESSSettings
-			_ = json.Unmarshal([]byte(inbound.Settings), &vlessSettings)
-
-			newOutbounds = append(newOutbounds,
-				s.genVnext(inbound, streamSettings, client, vlessSettings.Encryption))
-		case "trojan", "shadowsocks":
-			newOutbounds = append(newOutbounds, s.genServer(inbound, streamSettings, client))
-		}
-
-		newOutbounds = append(newOutbounds, s.defaultOutbounds...)
-		newConfigJson := make(map[string]any)
-		for key, value := range s.configJson {
-			newConfigJson[key] = value
-		}
-		newConfigJson["outbounds"] = newOutbounds
-		newConfigJson["remarks"] = s.SubService.genRemark(inbound, client.Email, extPrxy["remark"].(string))
-
-		newConfig, _ := json.MarshalIndent(newConfigJson, "", "  ")
-		newJsonArray = append(newJsonArray, newConfig)
-	}
-
-	return newJsonArray
-}
-
-func (s *SubJsonService) streamData(stream string) map[string]any {
-	var streamSettings map[string]any
-	json.Unmarshal([]byte(stream), &streamSettings)
-	security, _ := streamSettings["security"].(string)
-	switch security {
-	case "tls":
-		streamSettings["tlsSettings"] = s.tlsData(streamSettings["tlsSettings"].(map[string]any))
-	case "reality":
-		streamSettings["realitySettings"] = s.realityData(streamSettings["realitySettings"].(map[string]any))
-	}
-	delete(streamSettings, "sockopt")
-
-	if s.fragment != "" {
-		streamSettings["sockopt"] = json_util.RawMessage(`{"dialerProxy": "fragment", "tcpKeepAliveIdle": 100, "tcpMptcp": true, "penetrate": true}`)
-	}
-
-	// remove proxy protocol
-	network, _ := streamSettings["network"].(string)
-	switch network {
-	case "tcp":
-		streamSettings["tcpSettings"] = s.removeAcceptProxy(streamSettings["tcpSettings"])
-	case "ws":
-		streamSettings["wsSettings"] = s.removeAcceptProxy(streamSettings["wsSettings"])
-	case "httpupgrade":
-		streamSettings["httpupgradeSettings"] = s.removeAcceptProxy(streamSettings["httpupgradeSettings"])
-	}
-	return streamSettings
-}
-
-func (s *SubJsonService) removeAcceptProxy(setting any) map[string]any {
-	netSettings, ok := setting.(map[string]any)
-	if ok {
-		delete(netSettings, "acceptProxyProtocol")
-	}
-	return netSettings
-}
-
-func (s *SubJsonService) tlsData(tData map[string]any) map[string]any {
-	tlsData := make(map[string]any, 1)
-	tlsClientSettings, _ := tData["settings"].(map[string]any)
-
-	tlsData["serverName"] = tData["serverName"]
-	tlsData["alpn"] = tData["alpn"]
-	if allowInsecure, ok := tlsClientSettings["allowInsecure"].(bool); ok {
-		tlsData["allowInsecure"] = allowInsecure
-	}
-	if fingerprint, ok := tlsClientSettings["fingerprint"].(string); ok {
-		tlsData["fingerprint"] = fingerprint
-	}
-	return tlsData
-}
-
-func (s *SubJsonService) realityData(rData map[string]any) map[string]any {
-	rltyData := make(map[string]any, 1)
-	rltyClientSettings, _ := rData["settings"].(map[string]any)
-
-	rltyData["show"] = false
-	rltyData["publicKey"] = rltyClientSettings["publicKey"]
-	rltyData["fingerprint"] = rltyClientSettings["fingerprint"]
-	rltyData["mldsa65Verify"] = rltyClientSettings["mldsa65Verify"]
-
-	// Set random data
-	rltyData["spiderX"] = "/" + random.Seq(15)
-	shortIds, ok := rData["shortIds"].([]any)
-	if ok && len(shortIds) > 0 {
-		rltyData["shortId"] = shortIds[random.Num(len(shortIds))].(string)
-	} else {
-		rltyData["shortId"] = ""
-	}
-	serverNames, ok := rData["serverNames"].([]any)
-	if ok && len(serverNames) > 0 {
-		rltyData["serverName"] = serverNames[random.Num(len(serverNames))].(string)
-	} else {
-		rltyData["serverName"] = ""
-	}
-
-	return rltyData
-}
-
-func (s *SubJsonService) genVnext(inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client, encryption string) json_util.RawMessage {
-	outbound := Outbound{}
-	outbound.Protocol = string(inbound.Protocol)
-	outbound.Tag = "proxy"
-	if s.mux != "" {
-		outbound.Mux = json_util.RawMessage(s.mux)
-	}
-	outbound.StreamSettings = streamSettings
-	// Emit flattened settings inside Settings to match new Xray format
-	settings := make(map[string]any)
-	settings["address"] = inbound.Listen
-	settings["port"] = inbound.Port
-	settings["id"] = client.ID
-	if inbound.Protocol == model.VLESS {
-		settings["flow"] = client.Flow
-		settings["encryption"] = encryption
-	}
-	if inbound.Protocol == model.VMESS {
-		settings["security"] = client.Security
-	}
-	outbound.Settings = settings
-
-	result, _ := json.MarshalIndent(outbound, "", "  ")
-	return result
-}
-
-func (s *SubJsonService) genServer(inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client) json_util.RawMessage {
-	outbound := Outbound{}
-
-	serverData := make([]ServerSetting, 1)
-	serverData[0] = ServerSetting{
-		Address:  inbound.Listen,
-		Port:     inbound.Port,
-		Level:    8,
-		Password: client.Password,
-	}
-
-	if inbound.Protocol == model.Shadowsocks {
-		var inboundSettings map[string]any
-		json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
-		method, _ := inboundSettings["method"].(string)
-		serverData[0].Method = method
-
-		// server password in multi-user 2022 protocols
-		if strings.HasPrefix(method, "2022") {
-			if serverPassword, ok := inboundSettings["password"].(string); ok {
-				serverData[0].Password = fmt.Sprintf("%s:%s", serverPassword, client.Password)
+		case model.VMESS:
+			p["type"] = "vmess"
+			p["uuid"] = client.ID
+			p["alterId"] = 0
+			p["cipher"] = client.Security
+		case model.VLESS:
+			p["type"] = "vless"
+			p["uuid"] = client.ID
+			p["encryption"] = "none"
+		case model.Trojan:
+			p["type"] = "trojan"
+			p["password"] = client.Password
+		case model.Shadowsocks:
+			p["type"] = "ss"
+			p["password"] = client.Password
+			var inboundSettings map[string]any
+			_ = json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
+			if method, ok := inboundSettings["method"].(string); ok {
+				p["cipher"] = method
 			}
 		}
+
+		// 网络类型
+		if network, ok := stream["network"].(string); ok {
+			p["network"] = network
+			switch network {
+			case "ws":
+				if wsPath, ok := stream["ws-path"].(string); ok {
+					p["ws-path"] = wsPath
+				}
+				if wsHeader, ok := stream["ws-headers"].(map[string]any); ok {
+					p["ws-headers"] = wsHeader
+				}
+			case "http":
+				if headers, ok := stream["http-headers"].(map[string]any); ok {
+					p["http-headers"] = headers
+				}
+			}
+		}
+
+		// TLS/Reality
+		if security, ok := stream["security"].(string); ok {
+			if security == "tls" {
+				p["tls"] = true
+				if s.fragment != "" {
+					p["skip-cert-verify"] = true
+				}
+			} else if security == "reality" {
+				p["tls"] = true
+				if pk, ok := stream["publicKey"].(string); ok {
+					p["publicKey"] = pk
+				}
+				if fp, ok := stream["fingerprint"].(string); ok {
+					p["fingerprint"] = fp
+				}
+				if sid, ok := stream["shortId"].(string); ok {
+					p["shortId"] = sid
+				} else {
+					p["shortId"] = random.Seq(8)
+				}
+			}
+		}
+
+		proxies = append(proxies, p)
 	}
 
-	outbound.Protocol = string(inbound.Protocol)
-	outbound.Tag = "proxy"
-	if s.mux != "" {
-		outbound.Mux = json_util.RawMessage(s.mux)
-	}
-	outbound.StreamSettings = streamSettings
-	outbound.Settings = map[string]any{
-		"servers": serverData,
-	}
-
-	result, _ := json.MarshalIndent(outbound, "", "  ")
-	return result
-}
-
-type Outbound struct {
-	Protocol       string               `json:"protocol"`
-	Tag            string               `json:"tag"`
-	StreamSettings json_util.RawMessage `json:"streamSettings"`
-	Mux            json_util.RawMessage `json:"mux,omitempty"`
-	Settings       map[string]any       `json:"settings,omitempty"`
-}
-
-// Legacy vnext-related structs removed for flattened schema
-
-type ServerSetting struct {
-	Password string `json:"password"`
-	Level    int    `json:"level"`
-	Address  string `json:"address"`
-	Port     int    `json:"port"`
-	Flow     string `json:"flow,omitempty"`
-	Method   string `json:"method,omitempty"`
+	return proxies
 }
